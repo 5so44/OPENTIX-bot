@@ -1,0 +1,40 @@
+name: manual-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "要做什麼？ test-notify = 測試 Discord 通知；probe = 探測頁面（產生校正用檔案）"
+        type: choice
+        options:
+          - test-notify
+          - probe
+        default: test-notify
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Run
+        run: python opentix_monitor.py --${{ inputs.mode }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_MENTION_USER_ID: ${{ secrets.DISCORD_MENTION_USER_ID }}
+
+      - name: Upload probe output
+        if: ${{ inputs.mode == 'probe' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-output
+          path: probe_output/
