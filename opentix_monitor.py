@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""OPENTIX 餘票監控 → Discord（或 LINE）推播
+"""OPENTIX 餘票監控 → Discord 推播
+
+做法：進入節目頁 → 點「電腦配位」→ 讀取各票區是否「完售」（忽略輪椅席）→ 有票就通知。
 
 用法：
   python opentix_monitor.py --test-notify # 測試通知是否設定成功
@@ -31,9 +33,6 @@ SHOW_INFO = os.getenv("SHOW_INFO", "2026/11/10(二) 19:30 衛武營音樂廳")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
 DISCORD_MENTION_ID = os.getenv("DISCORD_MENTION_USER_ID", "")  # 選填：通知時 @ 你，手機才會跳通知
 
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")  # 選填：也想收 LINE 才需要
-LINE_USER_ID = os.getenv("LINE_USER_ID", "")
-
 INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))  # 檢查間隔（秒）
 RENOTIFY_MIN = int(os.getenv("RENOTIFY_MINUTES", "15"))  # 持續有票時的重複提醒間隔
 UNKNOWN_ALERT_AFTER = int(os.getenv("UNKNOWN_ALERT_AFTER", "10"))  # 連續讀不到幾次就通知
@@ -44,17 +43,24 @@ def _split(name: str, default: str) -> list[str]:
     return [s.strip() for s in os.getenv(name, default).split(",") if s.strip()]
 
 
-# 「有票」：頁面主體中，文字「完全等於」下列其中之一、且未被停用的按鈕／連結
-BUY_TEXTS = _split("BUY_TEXTS", "立即購票,購票,訂購,選位購票,線上訂購,前往購票,選擇座位")
-# 「售完」：文字完全等於下列其中之一的按鈕／標籤
+# 票區名稱含有這些字就忽略（你沒資格買的票區）
+IGNORE_ZONE_WORDS = _split("IGNORE_ZONE_WORDS", "輪椅")
+# 票區文字含有這些字，代表該票區已售完
+ZONE_SOLD_WORDS = _split("ZONE_SOLD_WORDS", "完售,售完,已售完,已完售,暫無")
+# 節目頁上「完全等於」這些字的標籤，代表整場售完（備用判斷）
 SOLD_TEXTS = _split("SOLD_TEXTS", "售完,已售完,完售,已完售,暫無票券,暫無餘票,SoldOut,Soldout")
+
+SEAT_BUTTON_TEXT = os.getenv("SEAT_BUTTON_TEXT", "電腦配位")
 
 STATE_FILE = pathlib.Path("state.json")
 PROBE_DIR = pathlib.Path("probe_output")
 
 
-# ---------- 通知（Discord / LINE，有設定哪個就用哪個） ----------
-def _send_discord(text: str) -> bool:
+# ---------- 通知（Discord） ----------
+def notify(text: str) -> bool:
+    if not DISCORD_WEBHOOK:
+        print("[通知] 尚未設定 DISCORD_WEBHOOK_URL，略過推播")
+        return False
     if DISCORD_MENTION_ID:
         text = f"<@{DISCORD_MENTION_ID}> {text}"
     try:
@@ -65,35 +71,6 @@ def _send_discord(text: str) -> bool:
         return True
     except requests.RequestException as e:
         print(f"[Discord] 推播例外：{e}")
-        return False
-
-
-def notify(text: str) -> bool:
-    results = []
-    if DISCORD_WEBHOOK:
-        results.append(_send_discord(text))
-    if LINE_TOKEN and LINE_USER_ID:
-        results.append(_send_line(text))
-    if not results:
-        print("[通知] 尚未設定 DISCORD_WEBHOOK_URL（或 LINE 金鑰），略過推播")
-        return False
-    return any(results)
-
-
-def _send_line(text: str) -> bool:
-    try:
-        r = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers={"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"},
-            json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            print(f"[LINE] 推播失敗 {r.status_code}: {r.text}")
-            return False
-        return True
-    except requests.RequestException as e:
-        print(f"[LINE] 推播例外：{e}")
         return False
 
 
@@ -112,26 +89,50 @@ def save_state(state: dict) -> None:
 
 
 # ---------- 判斷邏輯 ----------
+PRICE_RE = re.compile(r"\$\s?\d[\d,]{2,}")
+
+
 def norm(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
-def classify(items: list[dict]) -> tuple[str, list[str]]:
-    """items: [{text, disabled, in_chrome}]；回傳 (狀態, 命中的文字)
-    狀態：available 有票 / soldout 售完 / unknown 讀不到場次資訊"""
-    buy_set = {norm(t) for t in BUY_TEXTS}
+def parse_zones(text: str):
+    """從票區頁文字解析出票區清單；找不到「選擇票區」回傳 None。
+    每個票區：{name, text}，text 為該票區卡片內的所有文字。"""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    start = next((i for i, l in enumerate(lines) if "選擇票區" in l), None)
+    if start is None:
+        return None
+    zones, cur, prev = [], None, ""
+    for l in lines[start + 1:]:
+        if PRICE_RE.search(l):
+            name = PRICE_RE.sub("", l).strip() or prev  # 名稱可能和價格同一行，也可能在上一行
+            cur = {"name": name, "text": l}
+            zones.append(cur)
+        elif cur is not None:
+            cur["text"] += "\n" + l
+        prev = l
+    return [z for z in zones if "區" in z["name"] or "席" in z["name"]]
+
+
+def classify_zones(zones: list[dict]) -> tuple[str, list[str]]:
+    """回傳 (狀態, 票區名稱)。available 有票 / soldout 全部完售 / unknown 讀不到"""
+    mine = [z for z in zones if not any(w in z["name"] for w in IGNORE_ZONE_WORDS)]
+    if not mine:
+        return "unknown", []
+    open_zones = [z["name"] for z in mine if not any(w in z["text"] for w in ZONE_SOLD_WORDS)]
+    if open_zones:
+        return "available", open_zones
+    return "soldout", [z["name"] for z in mine]
+
+
+def classify_labels(items: list[dict], page_text: str = "") -> tuple[str, list[str]]:
+    """備用：節目頁上若出現「售完」標籤（按鈕或單獨一行文字）才判定為售完，
+    其餘一律視為 unknown（避免誤報有票）"""
     sold_set = {norm(t) for t in SOLD_TEXTS}
-    body = [i for i in items if not i.get("in_chrome") and norm(i.get("text", ""))]
-
-    buy_hits = [norm(i["text"]) for i in body if norm(i["text"]) in buy_set and not i.get("disabled")]
-    if buy_hits:
-        return "available", buy_hits
-
-    sold_hits = [norm(i["text"]) for i in body if norm(i["text"]) in sold_set]
-    if sold_hits:
-        return "soldout", sold_hits
-
-    return "unknown", []
+    hits = [norm(i["text"]) for i in items if not i.get("in_chrome") and norm(i.get("text", "")) in sold_set]
+    hits += [norm(l) for l in page_text.splitlines() if norm(l) in sold_set]
+    return ("soldout", hits) if hits else ("unknown", [])
 
 
 JS_COLLECT = """
@@ -145,13 +146,52 @@ els => els.map(e => ({
 """
 
 
+# ---------- 頁面操作 ----------
 def load_page(page) -> None:
     page.goto(URL, wait_until="domcontentloaded", timeout=45000)
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except PWTimeout:
         pass
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
+
+
+def dismiss_cookie(page) -> None:
+    try:
+        btn = page.get_by_text("同意", exact=True)
+        if btn.count():
+            btn.first.click(timeout=3000)
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def open_seat_page(page):
+    """點「電腦配位」進入票區頁；回傳票區頁（可能是同一個分頁或新分頁），找不到按鈕回傳 None。"""
+    loc = page.get_by_text(SEAT_BUTTON_TEXT, exact=True)
+    if loc.count() == 0:
+        return None
+    target = page
+    try:
+        with page.context.expect_page(timeout=4000) as info:
+            loc.first.click(timeout=10000)
+        target = info.value
+        target.wait_for_load_state("domcontentloaded", timeout=30000)
+    except PWTimeout:
+        target = page  # 沒有開新分頁，就是在原分頁跳轉
+    try:
+        target.get_by_text("選擇票區").first.wait_for(timeout=20000)
+    except PWTimeout:
+        return target
+    target.wait_for_timeout(1500)
+    refresh = target.get_by_text("更新票況")
+    if refresh.count():
+        try:
+            refresh.first.click(timeout=3000)
+            target.wait_for_timeout(2000)
+        except Exception:
+            pass
+    return target
 
 
 def check_once(browser) -> tuple[str, list[str]]:
@@ -159,8 +199,14 @@ def check_once(browser) -> tuple[str, list[str]]:
     try:
         page = ctx.new_page()
         load_page(page)
+        dismiss_cookie(page)
+        seat = open_seat_page(page)
+        if seat is not None:
+            zones = parse_zones(seat.inner_text("body"))
+            if zones:
+                return classify_zones(zones)
         items = page.eval_on_selector_all("button, a, [role=button]", JS_COLLECT)
-        return classify(items)
+        return classify_labels(items, page.inner_text("body"))
     finally:
         ctx.close()
 
@@ -172,7 +218,6 @@ def probe() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="zh-TW", viewport={"width": 1280, "height": 1800})
-        page = ctx.new_page()
 
         def on_response(r):
             try:
@@ -181,23 +226,39 @@ def probe() -> None:
             except Exception:
                 pass
 
-        page.on("response", on_response)
+        ctx.on("response", on_response)
+        page = ctx.new_page()
         load_page(page)
+        dismiss_cookie(page)
         page.screenshot(path=str(PROBE_DIR / "page.png"), full_page=True)
         (PROBE_DIR / "page_text.txt").write_text(page.inner_text("body"), encoding="utf-8")
-        items = page.eval_on_selector_all("button, a, [role=button]", JS_COLLECT)
-        (PROBE_DIR / "clickables.json").write_text(
-            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+
+        seat = open_seat_page(page)
+        if seat is None:
+            print(f"找不到「{SEAT_BUTTON_TEXT}」按鈕")
+        else:
+            print(f"票區頁網址：{seat.url}")
+            seat.screenshot(path=str(PROBE_DIR / "seatpage.png"), full_page=True)
+            text = seat.inner_text("body")
+            (PROBE_DIR / "seatpage_text.txt").write_text(text, encoding="utf-8")
+            (PROBE_DIR / "seatpage.html").write_text(seat.content(), encoding="utf-8")
+            zones = parse_zones(text)
+            if zones is None:
+                print("票區頁：找不到「選擇票區」")
+            else:
+                print("解析到的票區：")
+                for z in zones:
+                    sold = any(w in z["text"] for w in ZONE_SOLD_WORDS)
+                    ignored = any(w in z["name"] for w in IGNORE_ZONE_WORDS)
+                    print(f"  - {z['name']} | {'完售' if sold else '有票?'}{' | 忽略' if ignored else ''}")
+                status, hits = classify_zones(zones)
+                print(f"目前判斷：{status}  票區：{hits}")
+
         (PROBE_DIR / "json_responses.json").write_text(
             json.dumps(responses, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         browser.close()
-
-    status, hits = classify(items)
-    print(f"目前判斷：{status}  命中：{hits}")
     print(f"已將探測結果存到資料夾：{PROBE_DIR.resolve()}")
-    print("請把 page.png、clickables.json、json_responses.json 傳給 Claude 校正。")
 
 
 # ---------- 主流程 ----------
@@ -219,7 +280,8 @@ def run_check(browser, state: dict) -> None:
         due = now - state.get("last_notified", 0) >= RENOTIFY_MIN * 60
         if state.get("last_status") != "available" or due:
             ok = notify(
-                f"🎫 有票釋出！\n{SHOW_NAME}\n{SHOW_INFO}\n\n馬上購票：\n{URL}\n（偵測時間 {now_str()}）"
+                f"🎫 有票釋出！\n{SHOW_NAME}\n{SHOW_INFO}\n"
+                f"有票的票區：{'、'.join(hits)}\n\n馬上購票：\n{URL}\n（偵測時間 {now_str()}）"
             )
             if ok:
                 state["last_notified"] = now
@@ -241,8 +303,7 @@ def run_check(browser, state: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--test-notify", "--test-line", dest="test_notify", action="store_true",
-                    help="送出一則測試通知")
+    ap.add_argument("--test-notify", dest="test_notify", action="store_true", help="送出一則測試通知")
     ap.add_argument("--probe", action="store_true", help="探測模式")
     ap.add_argument("--once", action="store_true", help="只檢查一次")
     args = ap.parse_args()
